@@ -1,52 +1,66 @@
 #!/usr/bin/env python3
-"""网页文章 -> Markdown 剪藏（交互式循环）
-运行: python clip.py ，然后不断粘贴网址回车即可；空行 / q 退出。
-保存目录固定为 ./Clippings/
-依赖: 仅 Python 标准库，适合 iSH / Alpine Linux
+# -*- coding: utf-8 -*-
 """
-import re, sys, json, datetime, select, html
+网页文章 -> Markdown 剪藏，面向 iSH / Alpine Linux 的轻依赖版本。
+
+特点：
+- 只依赖 Python 标准库，无需 pip install requests / trafilatura / lxml。
+- 支持普通网页和 X/Twitter 链接（X 内容尝试使用 fxtwitter 公共接口）。
+- 粘贴一个或多个网址回车；空行、q 或 Ctrl-D 退出。
+- Markdown 保存到脚本当前目录下的 Clippings/。
+- 兼容较旧 Python：不使用 str.removeprefix 等新语法。
+运行：python3 clip_ish.py
+"""
+
+import os
+import re
+import sys
+import json
+import html
+import datetime
+from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
+from pathlib import Path
+from urllib.parse import urlparse, urljoin, quote, parse_qsl, urlencode
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
-from email.utils import parsedate_to_datetime
-from pathlib import Path
-from urllib.parse import urlparse, urljoin
 
 SAVE_DIR = Path("./Clippings")
-UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
-BOT_UA = "Twitterbot/1.0"  # x.com 对爬虫 UA 才返回带 og 标签的静态页
+UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+      "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 "
+      "Mobile/15E148 Safari/604.1")
+BOT_UA = "Twitterbot/1.0"
 X_HOSTS = {"x.com", "twitter.com", "mobile.twitter.com"}
+TIMEOUT = 25
+MAX_HTML_BYTES = 5 * 1024 * 1024
 
-# Windows 保留设备名（不区分大小写，带扩展名也非法）
-WIN_RESERVED = {"CON", "PRN", "AUX", "NUL",
-                *(f"COM{i}" for i in range(1, 10)),
-                *(f"LPT{i}" for i in range(1, 10))}
-
-
-def yq(s):
-    s = (s or "").replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ").strip()
-    return f'"{s}"'
+WIN_RESERVED = set(
+    ["CON", "PRN", "AUX", "NUL"] +
+    ["COM%d" % i for i in range(1, 10)] +
+    ["LPT%d" % i for i in range(1, 10)]
+)
 
 
-def safe_name(s, maxlen=80):
-    """去除 Windows/macOS/Linux/Obsidian 的非法或保留字符，保证文件名可用"""
-    s = s or ""
-    s = re.sub(r'[\x00-\x1f\x7f]', " ", s)          # 控制字符(含换行/制表)
-    s = re.sub(r'[\\/:*?"<>|]', " ", s)             # Win 非法 + 路径分隔符 (/ 为 Linux/macOS 非法, : 为旧 macOS 非法)
-    s = re.sub(r'[#^\[\]]', " ", s)                 # Obsidian 链接保留字符
-    s = re.sub(r'[\u200b-\u200f\u202a-\u202e\u2060\ufeff]', "", s)  # 零宽/方向控制字符
-    s = re.sub(r"\s+", " ", s).strip()
-    s = s[:maxlen].strip()
-    s = s.rstrip(" .")                              # Windows 不允许以空格或点结尾
-    s = s.lstrip(".")                               # 避免变成隐藏文件
-    if s.split(".")[0].upper() in WIN_RESERVED:     # CON / NUL.txt 等
-        s = "_" + s
-    return s or "untitled"
+def yq(value):
+    value = (value or "").replace("\\", "\\\\").replace('"', '\\"')
+    value = value.replace("\r", " ").replace("\n", " ").strip()
+    return '"' + value + '"'
 
 
-def get_html(url, ua=UA):
-    """使用标准库请求网页，避免 requests 等第三方依赖。"""
+def safe_name(value, maxlen=100):
+    value = value or ""
+    value = re.sub(r'[\x00-\x1f\x7f]', " ", value)
+    value = re.sub(r'[\\/:*?"<>|]', " ", value)
+    value = re.sub(r'[#^\[\]]', " ", value)
+    value = re.sub(r'[\u200b-\u200f\u202a-\u202e\u2060\ufeff]', "", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    value = value[:maxlen].strip().rstrip(" .").lstrip(".")
+    if value.split(".")[0].upper() in WIN_RESERVED:
+        value = "_" + value
+    return value or "untitled"
+
+
+def fetch_bytes(url, ua=UA):
     req = Request(url, headers={
         "User-Agent": ua,
         "Accept": "text/html,application/xhtml+xml,application/json,*/*;q=0.8",
@@ -54,349 +68,250 @@ def get_html(url, ua=UA):
         "Connection": "close",
     })
     try:
-        with urlopen(req, timeout=30) as response:
-            data = response.read(5 * 1024 * 1024 + 1)
-            if len(data) > 5 * 1024 * 1024:
-                raise RuntimeError("网页超过 5 MB，已停止读取")
-            charset = response.headers.get_content_charset() or "utf-8"
+        with urlopen(req, timeout=TIMEOUT) as response:
+            data = response.read(MAX_HTML_BYTES + 1)
+            charset = response.headers.get_content_charset()
     except HTTPError as exc:
         raise RuntimeError("HTTP 错误 %s：%s" % (exc.code, exc.reason))
     except URLError as exc:
         raise RuntimeError("网络请求失败：%s" % exc.reason)
-    try:
-        return data.decode(charset)
-    except (LookupError, UnicodeDecodeError):
-        for enc in ("utf-8", "gb18030", "big5"):
-            try:
-                return data.decode(enc)
-            except (LookupError, UnicodeDecodeError):
-                pass
-        return data.decode("utf-8", "replace")
+    if len(data) > MAX_HTML_BYTES:
+        raise RuntimeError("网页超过 5 MB，已停止读取")
+    return data, charset
 
 
-def meta_fallback(html, names):
-    for n in names:
-        m = re.search(r'<meta[^>]+(?:name|property)=["\']%s["\'][^>]*content=["\']([^"\']*)' % re.escape(n), html, re.I) \
-            or re.search(r'<meta[^>]+content=["\']([^"\']*)["\'][^>]*(?:name|property)=["\']%s["\']' % re.escape(n), html, re.I)
-        if m and m.group(1).strip():
-            return m.group(1).strip()
-    return ""
+def decode_bytes(data, charset=None):
+    candidates = []
+    if charset:
+        candidates.append(charset)
+    # 从 HTML 前部识别 charset
+    head = data[:8192].decode("ascii", "ignore")
+    m = re.search(r'charset\s*=\s*["\']?\s*([a-zA-Z0-9._-]+)', head, re.I)
+    if m:
+        candidates.append(m.group(1))
+    candidates.extend(["utf-8", "gb18030", "big5"])
+    for enc in candidates:
+        try:
+            return data.decode(enc)
+        except (LookupError, UnicodeDecodeError):
+            pass
+    return data.decode("utf-8", "replace")
 
 
-def unescape(s):
-    import html as _h
-    return _h.unescape(s or "")
+def get_text(url, ua=UA):
+    data, charset = fetch_bytes(url, ua)
+    return decode_bytes(data, charset)
 
 
-def norm_date(v):
-    """各种时间表示 -> 本地时区 yyyy-mm-dd；无法识别返回空串"""
-    if not v:
+def norm_date(value):
+    if not value:
         return ""
     try:
-        if isinstance(v, (int, float)) or str(v).isdigit():
-            dt = datetime.datetime.fromtimestamp(int(v))
+        if isinstance(value, (int, float)) or str(value).isdigit():
+            stamp = float(value)
+            if stamp > 100000000000:
+                stamp /= 1000.0
+            dt = datetime.datetime.fromtimestamp(stamp)
         else:
-            v = str(v).strip()
+            value = str(value).strip()
             try:
-                dt = parsedate_to_datetime(v)                     # Sat Oct 10 12:00:00 +0000 2026 / RFC 2822
+                dt = parsedate_to_datetime(value)
             except Exception:
                 try:
-                    dt = datetime.datetime.strptime(v, "%a %b %d %H:%M:%S %z %Y")
+                    dt = datetime.datetime.strptime(value, "%a %b %d %H:%M:%S %z %Y")
                 except ValueError:
-                    dt = datetime.datetime.fromisoformat(v.replace("Z", "+00:00"))
+                    dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
             if dt.tzinfo:
                 dt = dt.astimezone()
         return dt.strftime("%Y-%m-%d")
     except Exception:
-        m = re.match(r"(\d{4})-(\d{2})-(\d{2})", str(v))
+        m = re.match(r"(\d{4})-(\d{2})-(\d{2})", str(value))
         return m.group(0) if m else ""
 
 
 def snowflake_date(url):
-    """推文 ID 内含时间戳，可离线还原发布日期"""
-    m = re.search(r"/status/(\d+)", url)
-    if not m:
+    match = re.search(r"/status/(\d+)", url)
+    if not match:
         return ""
-    ms = (int(m.group(1)) >> 22) + 1288834974657
-    return norm_date(ms // 1000)
+    millis = (int(match.group(1)) >> 22) + 1288834974657
+    return norm_date(millis / 1000.0)
 
 
-def clean_x_author(s):
-    """'艾地声Edysen (@KA594594) on X: "..."' -> '艾地声Edysen (@KA594594)'"""
-    return re.split(r"\s+on\s+(?:X|Twitter)\b", s or "", maxsplit=1)[0].strip()
+def clean_x_author(value):
+    return re.split(r"\s+on\s+(?:X|Twitter)\b", value or "", maxsplit=1)[0].strip()
 
 
-def x_api(url):
-    """fxtwitter 公共接口：长推文/X 文章(Article)的完整内容"""
-    m = re.search(r"/([^/]+)/status/(\d+)", url)
-    if not m:
-        return None
-    api_url = f"https://api.fxtwitter.com/{m.group(1)}/status/{m.group(2)}"
-    raw = get_html(api_url, UA)
-    try:
-        return json.loads(raw).get("tweet")
-    except ValueError:
-        raise RuntimeError("fxtwitter 返回的不是有效 JSON")
+class PageParser(HTMLParser):
+    """轻量 HTML 解析器：提取 meta、标题及主要正文，避免 lxml 等编译依赖。"""
+    SKIP_TAGS = set(["script", "style", "noscript", "svg", "canvas", "nav",
+                     "footer", "header", "aside", "form", "button", "iframe"])
 
-
-def article_to_md(article):
-    """X Article 的 draft.js 块 -> Markdown"""
-    blocks = ((article.get("content") or {}).get("blocks")) or []
-    out, n = [], 0
-    for b in blocks:
-        t, txt = b.get("type", ""), (b.get("text") or "").strip()
-        n = n + 1 if t == "ordered-list-item" else 0
-        if not txt:
-            continue
-        if t == "header-one":
-            out.append(f"# {txt}")
-        elif t == "header-two":
-            out.append(f"## {txt}")
-        elif t == "header-three":
-            out.append(f"### {txt}")
-        elif t == "unordered-list-item":
-            out.append(f"- {txt}")
-        elif t == "ordered-list-item":
-            out.append(f"{n}. {txt}")
-        elif t == "blockquote":
-            out.append(f"> {txt}")
-        elif t == "code-block":
-            out.append(f"```\n{txt}\n```")
-        else:
-            out.append(txt)
-    return "\n\n".join(out)
-
-
-def media_md(tweet):
-    lines = []
-    for m in ((tweet.get("media") or {}).get("all")) or []:
-        u = m.get("url")
-        if not u:
-            continue
-        lines.append(f"![]({u})" if m.get("type") == "photo" else f"[{m.get('type', 'media')}]({u})")
-    return "\n\n".join(lines)
-
-
-def clip_x(url):
-    tweet, desc, author, published, body = None, "", "", "", ""
-    try:
-        tweet = x_api(url)
-    except Exception as e:
-        print("  (fxtwitter 接口失败，改用页面元数据)", e)
-    if tweet:
-        a = tweet.get("author") or {}
-        author = f"{a.get('name', '')} (@{a.get('screen_name', '')})".strip()
-        published = norm_date(tweet.get("created_timestamp") or tweet.get("created_at"))
-        article = tweet.get("article")
-        if article:
-            desc = (article.get("title") or tweet.get("text") or "").strip()
-            body = article_to_md(article)
-            if not body:   # 结构不认识：存下原始 JSON 便于排查
-                SAVE_DIR.mkdir(parents=True, exist_ok=True)
-                dbg = SAVE_DIR / "_debug_x.json"
-                dbg.write_text(json.dumps(tweet, ensure_ascii=False, indent=2), encoding="utf-8")
-                print(f"  ! 文章正文为空，原始数据已存到 {dbg}")
-            cover = (((article.get("cover_media") or {}).get("media_info")) or {}).get("original_img_url")
-            if cover:
-                body = f"![]({cover})\n\n" + body
-        else:
-            desc = (tweet.get("text") or "").strip()
-            body = desc
-        extra = media_md(tweet)
-        if extra:
-            body += "\n\n" + extra
-        q = tweet.get("quote")
-        if q:
-            body += "\n\n> 引用 " + (q.get("url") or "") + "\n> " + (q.get("text") or "").replace("\n", "\n> ")
-    if not desc:  # 接口失败：退回 og 标签（内容可能被截断）
-        html = get_html(url, BOT_UA)
-        desc = unescape(meta_fallback(html, ["og:description", "twitter:description", "description"]))
-        author = clean_x_author(unescape(meta_fallback(html, ["og:title", "twitter:title"])))
-        body = desc
-    if not desc:
-        raise RuntimeError("未取到推文内容（可能需要登录或被限制）")
-    desc = desc.strip().strip('“”"')
-    author = clean_x_author(author)
-    published = published or snowflake_date(url)
-    fields = [("title", desc[:100]), ("source", url), ("author", author),
-              ("site", "X"), ("published", published), ("description", desc)]
-    return write_md(desc, fields, body)       # 文件名 = description
-
-
-def confirm_duplicate(base):
-    """发现同标题剪藏文件时询问；60 秒没有输入就取消。"""
-    matches = []
-    exact = SAVE_DIR / (base + ".md")
-    if exact.exists():
-        matches.append(exact)
-    # 也识别此前确认重复后产生的“标题 (2).md”等文件
-    for candidate in SAVE_DIR.glob(base + " (*).md"):
-        if candidate.is_file() and re.match(r"^" + re.escape(base) + r" \(\d+\)\.md$", candidate.name):
-            matches.append(candidate)
-    if not matches:
-        return True
-
-    print("  ! 检测到可能已经剪藏过的文章：")
-    for candidate in sorted(set(matches), key=lambda x: x.name)[:5]:
-        print("    -", candidate.name)
-    if len(matches) > 5:
-        print("    ……以及其他 %d 个文件" % (len(matches) - 5))
-    print("是否仍要剪藏并另存为新文件？[y/N]（60 秒无回复将取消）: ", end="", flush=True)
-    try:
-        ready, _, _ = select.select([sys.stdin], [], [], 60)
-        if not ready:
-            print("\n  已超时，取消保存。")
-            return False
-        answer = sys.stdin.readline().strip().lower()
-    except (OSError, ValueError):
-        # 若当前终端不支持 select，宁可取消也不无限等待
-        print("\n  当前终端不支持超时输入，取消保存。")
-        return False
-    if answer in ("y", "yes", "是", "要"):
-        return True
-    print("  已取消保存。")
-    return False
-
-
-def write_md(title_for_name, fm_fields, body):
-    SAVE_DIR.mkdir(parents=True, exist_ok=True)
-    base = safe_name(title_for_name)
-    if not confirm_duplicate(base):
-        return None
-
-    now = datetime.date.today().strftime("%Y-%m-%d")
-    fm = ["---"]
-    for k, v in fm_fields:
-        fm.append(f"{k}: {v}" if k == "published" else f"{k}: {yq(v)}")
-    fm += [f"created: {now}", "tags:", "  - clippings", "---", ""]
-    path = SAVE_DIR / f"{base}.md"
-    n = 2
-    while path.exists():
-        path = SAVE_DIR / f"{base} ({n}).md"
-        n += 1
-    path.write_text("\n".join(fm) + (body or "").strip() + "\n", encoding="utf-8")
-    return path
-
-
-class SimpleHTMLExtractor(HTMLParser):
-    """轻量网页提取器；适用于 iSH，不需要 lxml / trafilatura。"""
-    SKIP = {"script", "style", "noscript", "svg", "nav", "footer", "header", "aside", "form", "button", "iframe"}
-
-    def __init__(self, url):
-        super().__init__(convert_charrefs=True)
-        self.url = url
+    def __init__(self, base_url):
+        HTMLParser.__init__(self, convert_charrefs=True)
+        self.base_url = base_url
         self.meta = {}
         self.title_parts = []
         self.in_title = False
-        self.skip = 0
-        self.parts = []
-        self.in_article = 0
-        self.in_para = False
-        self.para = []
-        self.in_heading = None
-        self.heading = []
-        self.in_link = None
-        self.link_text = []
+        self.skip_depth = 0
+        self.body_parts = []
+        self.capture_depth = 0
+        self.current_link = None
+        self.current_link_text = []
+        self.list_stack = []
+        self.pending_space = False
         self.in_pre = False
-        self.pre = []
+        self.pre_parts = []
+        self.in_blockquote = False
+        self.in_heading = None
+        self.heading_parts = []
         self.in_li = False
-        self.li = []
-        self.in_list = []
+        self.li_parts = []
+        self.in_paragraph = False
+        self.p_parts = []
+        self.candidates = []
+        self.candidate_depth = 0
+        self.candidate_parts = []
+        self.in_article = False
+        self.article_depth = 0
+        self.main_depth = 0
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
         if tag == "meta":
             key = (a.get("property") or a.get("name") or a.get("itemprop") or "").lower()
-            if key and a.get("content") and key not in self.meta:
-                self.meta[key] = a["content"].strip()
+            val = a.get("content", "").strip()
+            if key and val and key not in self.meta:
+                self.meta[key] = val
         if tag == "title":
             self.in_title = True
-        if tag in self.SKIP:
-            self.skip += 1
-            return
-        if self.skip:
-            return
         if tag in ("article", "main"):
-            self.in_article += 1
+            self.capture_depth += 1
+            self.candidate_depth += 1
+            if tag == "article":
+                self.in_article = True
+            if tag == "main":
+                self.main_depth += 1
+        if tag in self.SKIP_TAGS:
+            self.skip_depth += 1
+            return
+        if self.skip_depth:
+            return
         if tag in ("h1", "h2", "h3", "h4"):
-            self.in_heading, self.heading = tag, []
+            self.in_heading = tag
+            self.heading_parts = []
         elif tag == "p":
-            self.in_para, self.para = True, []
+            self.in_paragraph = True
+            self.p_parts = []
+        elif tag == "blockquote":
+            self.in_blockquote = True
         elif tag == "pre":
-            self.in_pre, self.pre = True, []
+            self.in_pre = True
+            self.pre_parts = []
         elif tag in ("ul", "ol"):
-            self.in_list.append([tag, 0])
+            self.list_stack.append({"tag": tag, "n": 0})
         elif tag == "li":
-            self.in_li, self.li = True, []
+            self.in_li = True
+            self.li_parts = []
         elif tag == "a" and a.get("href"):
-            self.in_link, self.link_text = urljoin(self.url, a["href"]), []
-        elif tag in ("div", "section", "article", "main", "br"):
-            self.parts.append("\n\n")
+            self.current_link = urljoin(self.base_url, a["href"])
+            self.current_link_text = []
+        elif tag == "br":
+            self._append_text("\n")
+        elif tag in ("div", "section", "article", "main", "tr"):
+            self._append_text("\n\n")
 
     def handle_endtag(self, tag):
         if tag == "title":
             self.in_title = False
-        if tag in self.SKIP:
-            if self.skip:
-                self.skip -= 1
+        if tag in self.SKIP_TAGS:
+            if self.skip_depth:
+                self.skip_depth -= 1
             return
-        if self.skip:
+        if self.skip_depth:
             return
-        if tag in ("article", "main") and self.in_article:
-            self.in_article -= 1
+        if tag in ("article", "main"):
+            if self.capture_depth:
+                self.capture_depth -= 1
+            if tag == "article":
+                self.in_article = False
+            if tag == "main" and self.main_depth:
+                self.main_depth -= 1
         if tag in ("h1", "h2", "h3", "h4") and self.in_heading:
-            text = self._join(self.heading)
+            text = self._join(self.heading_parts)
             if text:
-                self.parts.append("\n\n" + "#" * int(self.in_heading[1]) + " " + text + "\n\n")
+                level = int(self.in_heading[1])
+                self.body_parts.append("\n\n" + "#" * level + " " + text + "\n\n")
+                self.candidate_parts.append("\n\n" + "#" * level + " " + text + "\n\n")
             self.in_heading = None
-        elif tag == "p" and self.in_para:
-            text = self._join(self.para)
+        elif tag == "p" and self.in_paragraph:
+            text = self._join(self.p_parts)
             if text:
-                self.parts.append("\n\n" + text + "\n\n")
-            self.in_para = False
+                block = "\n\n" + text + "\n\n"
+                self.body_parts.append(block)
+                self.candidate_parts.append(block)
+            self.in_paragraph = False
+        elif tag == "blockquote":
+            self.in_blockquote = False
         elif tag == "pre" and self.in_pre:
-            text = "".join(self.pre).strip()
+            text = "".join(self.pre_parts).strip()
             if text:
-                self.parts.append("\n\n```\n" + text + "\n```\n\n")
+                block = "\n\n```\n" + text + "\n```\n\n"
+                self.body_parts.append(block)
+                self.candidate_parts.append(block)
             self.in_pre = False
         elif tag == "li" and self.in_li:
-            text = self._join(self.li)
+            text = self._join(self.li_parts)
             if text:
                 marker = "- "
-                if self.in_list and self.in_list[-1][0] == "ol":
-                    self.in_list[-1][1] += 1
-                    marker = str(self.in_list[-1][1]) + ". "
-                self.parts.append("\n" + marker + text)
+                if self.list_stack and self.list_stack[-1]["tag"] == "ol":
+                    self.list_stack[-1]["n"] += 1
+                    marker = str(self.list_stack[-1]["n"]) + ". "
+                block = "\n" + marker + text
+                self.body_parts.append(block)
+                self.candidate_parts.append(block)
             self.in_li = False
-        elif tag in ("ul", "ol") and self.in_list:
-            self.in_list.pop()
-            self.parts.append("\n\n")
-        elif tag == "a" and self.in_link:
-            text = self._join(self.link_text)
+        elif tag in ("ul", "ol") and self.list_stack:
+            self.list_stack.pop()
+            self.body_parts.append("\n\n")
+            self.candidate_parts.append("\n\n")
+        elif tag == "a" and self.current_link:
+            text = self._join(self.current_link_text)
             if text:
-                self.parts.append("[" + text + "](" + self.in_link + ")")
-            self.in_link = None
-        elif tag in ("div", "section", "article", "main"):
-            self.parts.append("\n\n")
+                rendered = "[" + text + "](" + self.current_link + ")"
+                self._append_text(rendered)
+            self.current_link = None
+            self.current_link_text = []
+        elif tag in ("div", "section", "article", "main", "tr"):
+            self.body_parts.append("\n\n")
+            self.candidate_parts.append("\n\n")
+
+    def _append_text(self, text):
+        if self.skip_depth:
+            return
+        if self.in_title:
+            self.title_parts.append(text)
+        if self.in_pre:
+            self.pre_parts.append(text)
+            return
+        if self.in_heading:
+            self.heading_parts.append(text)
+        if self.in_paragraph:
+            self.p_parts.append(text)
+        if self.in_li:
+            self.li_parts.append(text)
+        if self.current_link:
+            self.current_link_text.append(text)
+            return
+        if self.in_blockquote:
+            text = "> " + text
+        self.body_parts.append(text)
+        self.candidate_parts.append(text)
 
     def handle_data(self, data):
-        if self.skip or not data:
+        if not data or self.skip_depth:
             return
         data = re.sub(r"\s+", " ", data)
-        if self.in_title:
-            self.title_parts.append(data)
-        if self.in_pre:
-            self.pre.append(data)
-        elif self.in_heading:
-            self.heading.append(data)
-        elif self.in_para:
-            self.para.append(data)
-        elif self.in_li:
-            self.li.append(data)
-        elif self.in_link:
-            self.link_text.append(data)
-        else:
-            self.parts.append(data)
+        self._append_text(data)
 
     @staticmethod
     def _join(parts):
@@ -408,59 +323,383 @@ class SimpleHTMLExtractor(HTMLParser):
         return text.strip()
 
     def result(self):
-        return self._join(self.title_parts), self._join(self.parts), self.meta
+        title = self._join(self.title_parts)
+        body = self._join(self.body_parts)
+        # 若有 article/main 标签，正文候选通常比整页文本更集中；
+        # 轻量解析无法像 trafilatura 一样精确识别所有网站的正文。
+        candidate = self._join(self.candidate_parts)
+        if len(candidate) >= 200 and self.capture_depth == 0:
+            body = candidate
+        return title, body, self.meta
 
 
-def clip_generic(url):
-    page = get_html(url)
-    parser = SimpleHTMLExtractor(url)
+def parse_page(url, page_html):
+    parser = PageParser(url)
     try:
-        parser.feed(page)
+        parser.feed(page_html)
         parser.close()
     except Exception:
         pass
-    tag_title, body, meta = parser.result()
-    title = (meta.get("og:title") or meta.get("twitter:title") or tag_title or "untitled").strip()
-    author = meta.get("author") or meta.get("article:author") or meta.get("twitter:creator") or ""
-    published = norm_date(meta.get("article:published_time") or meta.get("datepublished") or meta.get("pubdate") or meta.get("date"))
-    desc = meta.get("og:description") or meta.get("twitter:description") or meta.get("description") or ""
-    site = meta.get("og:site_name") or urlparse(url).netloc
+    return parser.result()
+
+
+def meta_value(meta, *keys):
+    for key in keys:
+        value = meta.get(key.lower(), "")
+        if value:
+            return html.unescape(value).strip()
+    return ""
+
+
+def x_api(url):
+    match = re.search(r"/([^/?]+)/status/(\d+)", url)
+    if not match:
+        return None
+    api_url = "https://api.fxtwitter.com/%s/status/%s" % (match.group(1), match.group(2))
+    raw = get_text(api_url, UA)
+    try:
+        return json.loads(raw).get("tweet")
+    except ValueError:
+        raise RuntimeError("fxtwitter 返回的不是有效 JSON")
+
+
+def article_to_md(article):
+    blocks = ((article.get("content") or {}).get("blocks")) or []
+    out = []
+    number = 0
+    for block in blocks:
+        kind = block.get("type", "")
+        text = (block.get("text") or "").strip()
+        if kind == "ordered-list-item":
+            number += 1
+        else:
+            number = 0
+        if not text:
+            continue
+        if kind == "header-one":
+            out.append("# " + text)
+        elif kind == "header-two":
+            out.append("## " + text)
+        elif kind == "header-three":
+            out.append("### " + text)
+        elif kind == "unordered-list-item":
+            out.append("- " + text)
+        elif kind == "ordered-list-item":
+            out.append(str(number) + ". " + text)
+        elif kind == "blockquote":
+            out.append("> " + text.replace("\n", "\n> "))
+        elif kind == "code-block":
+            out.append("```\n" + text + "\n```")
+        else:
+            out.append(text)
+    return "\n\n".join(out)
+
+
+def media_md(tweet):
+    lines = []
+    media = ((tweet.get("media") or {}).get("all")) or []
+    for item in media:
+        url = item.get("url")
+        if not url:
+            continue
+        if item.get("type") == "photo":
+            lines.append("![](%s)" % url)
+        else:
+            lines.append("[%s](%s)" % (item.get("type", "media"), url))
+    return "\n\n".join(lines)
+
+
+def write_md(title_for_name, fields, body):
+    SAVE_DIR.mkdir(parents=True, exist_ok=True)
+    today = datetime.date.today().strftime("%Y-%m-%d")
+    frontmatter = ["---"]
+    for key, value in fields:
+        if key == "published" and value:
+            frontmatter.append("%s: %s" % (key, value))
+        elif key == "published":
+            frontmatter.append('%s: ""' % key)
+        else:
+            frontmatter.append("%s: %s" % (key, yq(value)))
+    frontmatter.extend(["created: " + today, "tags:", "  - clippings", "---", ""])
+    base = safe_name(title_for_name)
+    path = SAVE_DIR / (base + ".md")
+    number = 2
+    while path.exists():
+        path = SAVE_DIR / ("%s (%d).md" % (base, number))
+        number += 1
+    content = "\n".join(frontmatter) + (body or "").strip() + "\n"
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+def clip_x(url):
+    tweet = None
+    try:
+        tweet = x_api(url)
+    except Exception as exc:
+        print("  (fxtwitter 接口失败，改用页面元数据：%s)" % exc)
+    desc = author = published = body = ""
+    if tweet:
+        author_info = tweet.get("author") or {}
+        author = "%s (@%s)" % (
+            author_info.get("name", ""),
+            author_info.get("screen_name", "")
+        )
+        author = author.strip()
+        published = norm_date(tweet.get("created_timestamp") or tweet.get("created_at"))
+        article = tweet.get("article")
+        if article:
+            desc = (article.get("title") or tweet.get("text") or "").strip()
+            body = article_to_md(article)
+            cover = (((article.get("cover_media") or {}).get("media_info")) or {}).get("original_img_url")
+            if cover:
+                body = "![](%s)\n\n%s" % (cover, body)
+        else:
+            desc = (tweet.get("text") or "").strip()
+            body = desc
+        extra = media_md(tweet)
+        if extra:
+            body += "\n\n" + extra
+        quoted = tweet.get("quote")
+        if quoted:
+            body += "\n\n> 引用 " + (quoted.get("url") or "") + "\n> " + (quoted.get("text") or "").replace("\n", "\n> ")
+    if not desc:
+        page = get_text(url, BOT_UA)
+        _, _, meta = parse_page(url, page)
+        desc = meta_value(meta, "og:description", "twitter:description", "description")
+        author = clean_x_author(meta_value(meta, "og:title", "twitter:title"))
+        body = desc
+    if not desc:
+        raise RuntimeError("未取到推文内容，可能需要登录或被网站限制")
+    desc = desc.strip().strip('“”"')
+    author = clean_x_author(author)
+    published = published or snowflake_date(url)
+    fields = [
+        ("title", desc[:100]), ("source", url), ("author", author),
+        ("site", "X"), ("published", published), ("description", desc)
+    ]
+    return write_md(desc, fields, body)
+
+
+def clip_generic(url):
+    page = get_text(url)
+    title_from_tag, body, meta = parse_page(url, page)
+    title = meta_value(meta, "og:title", "twitter:title") or title_from_tag
+    author = meta_value(meta, "author", "article:author", "twitter:creator")
+    published = norm_date(meta_value(
+        meta, "article:published_time", "datepublished", "pubdate",
+        "article:modified_time", "date"
+    ))
+    desc = meta_value(meta, "og:description", "twitter:description", "description")
+    site = meta_value(meta, "og:site_name") or urlparse(url).netloc
+    if not title:
+        title = "untitled"
     if not body or len(body.strip()) < 40:
+        # 有些页面正文由 JavaScript 动态生成，标准库无法执行 JS。
+        # 至少保留描述，避免生成完全空白的笔记。
         if desc:
             body = desc
         else:
-            raise RuntimeError("未能提取正文（页面可能依赖 JavaScript 动态加载）")
-    fields = [("title", title), ("source", url), ("author", author), ("site", site),
-              ("published", published), ("description", desc)]
+            raise RuntimeError("未能提取到正文（页面可能依赖 JavaScript 动态加载）")
+    fields = [
+        ("title", title), ("source", url), ("author", author),
+        ("site", site), ("published", published), ("description", desc)
+    ]
     return write_md(title, fields, body)
 
 
+# ---------------------------------------------------------------------------
+# 去重：用一个隐藏的索引文件记录“已剪藏网址 -> 文件名”。
+# 为了在 iSH 里稳定，正常流程只对这一个小文件做普通的读/追加，
+# 不遍历目录、不扫描所有 md（这类操作在 iSH 上可能闪退）。
+# 旧的剪藏文件可在提示符下输入 rescan 手动导入一次。
+# ---------------------------------------------------------------------------
+INDEX_NAME = ".iclip_index.tsv"
+
+TRACK_PARAMS = set(["fbclid", "gclid", "igshid", "spm", "ref", "ref_src",
+                    "mc_cid", "mc_eid", "s", "t"])
+
+
+def norm_url(url):
+    """规范化网址用于比较：忽略 http/https、www、锚点、末尾斜杠和常见追踪参数。"""
+    url = (url or "").strip()
+    try:
+        p = urlparse(url)
+        host = (p.netloc or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        if host in X_HOSTS:
+            host = "x.com"
+            query = ""
+        else:
+            pairs = []
+            for k, v in parse_qsl(p.query, keep_blank_values=True):
+                if k.lower().startswith("utm_") or k.lower() in TRACK_PARAMS:
+                    continue
+                pairs.append((k, v))
+            pairs.sort()
+            query = urlencode(pairs)
+        path = p.path or ""
+        while len(path) > 1 and path.endswith("/"):
+            path = path[:-1]
+        if path == "/":
+            path = ""
+        return host + path + (("?" + query) if query else "")
+    except Exception:
+        return url
+
+
+def index_path():
+    return str(SAVE_DIR / INDEX_NAME)
+
+
+def load_index():
+    """返回 {规范化网址: [文件名, ...]}；任何错误都当作空索引。"""
+    index = {}
+    try:
+        with open(index_path(), "r", encoding="utf-8", errors="replace") as f:
+            for line in f.read().splitlines():
+                if "\t" not in line:
+                    continue
+                key, name = line.split("\t", 1)
+                if key and name:
+                    index.setdefault(key, [])
+                    if name not in index[key]:
+                        index[key].append(name)
+    except Exception:
+        pass
+    return index
+
+
+def add_index(url, path):
+    """剪藏成功后记录；失败不影响主流程。"""
+    try:
+        SAVE_DIR.mkdir(parents=True, exist_ok=True)
+        name = Path(str(path)).name
+        with open(index_path(), "a", encoding="utf-8") as f:
+            f.write("%s\t%s\n" % (norm_url(url), name))
+    except Exception as exc:
+        print("  (索引写入失败，不影响剪藏：%s)" % exc)
+
+
+def find_existing(url):
+    """返回该网址已剪藏且文件仍存在的文件名列表。"""
+    try:
+        names = load_index().get(norm_url(url), [])
+        return [n for n in names if os.path.exists(str(SAVE_DIR / n))]
+    except Exception:
+        return []
+
+
+def read_source(filepath):
+    """读取 md 文件 frontmatter 中的 source 字段；失败返回空串。"""
+    try:
+        with open(filepath, "rb") as f:
+            head = f.read(4096).decode("utf-8", "replace")
+    except Exception:
+        return ""
+    lines = head.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return ""
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        if line.startswith("source:"):
+            val = line[len("source:"):].strip()
+            if len(val) >= 2 and val[0] == '"' and val[-1] == '"':
+                val = val[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+            return val
+    return ""
+
+
+def rescan():
+    """手动命令：扫描 Clippings/ 里已有的 md，把 source 导入索引。"""
+    try:
+        names = sorted(os.listdir(str(SAVE_DIR)))
+    except Exception as exc:
+        print("  无法读取目录：%s" % exc)
+        return
+    index = load_index()
+    added = 0
+    for name in names:
+        if not name.endswith(".md"):
+            continue
+        src = read_source(os.path.join(str(SAVE_DIR), name))
+        if not src:
+            continue
+        key = norm_url(src)
+        index.setdefault(key, [])
+        if name not in index[key]:
+            index[key].append(name)
+            added += 1
+    lines = []
+    for key in sorted(index):
+        for name in index[key]:
+            lines.append("%s\t%s" % (key, name))
+    try:
+        with open(index_path(), "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + ("\n" if lines else ""))
+        print("  索引已更新，新增 %d 条，共 %d 条。" % (added, len(lines)))
+    except Exception as exc:
+        print("  索引写入失败：%s" % exc)
+
+
+def confirm(prompt):
+    """默认 N；EOF/Ctrl-C 视为否。"""
+    try:
+        ans = input(prompt).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return ans in ("y", "yes", "是", "好")
+
+
 def clip(url):
-    host = (urlparse(url).netloc or "").lower()
+    parsed = urlparse(url)
+    host = (parsed.netloc or "").lower()
     if host.startswith("www."):
         host = host[4:]
-    return clip_x(url) if host in X_HOSTS else clip_generic(url)
+    if parsed.scheme not in ("http", "https"):
+        raise RuntimeError("只支持 http:// 或 https:// 开头的网址")
+    if host in X_HOSTS:
+        return clip_x(url)
+    return clip_generic(url)
 
 
 def main():
-    print(f"网页剪藏 → {SAVE_DIR.resolve()}\n粘贴网址回车；空行或 q 退出。")
+    print("网页剪藏（iSH 轻依赖版） -> %s" % SAVE_DIR.resolve())
+    print("粘贴网址回车；一行可放多个网址；空行、q 或 Ctrl-D 退出。")
+    print("已剪藏过的网址会先询问；输入 rescan 可把旧剪藏导入去重索引。")
     while True:
         try:
             line = input("URL> ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
-        if not line or line.lower() in {"q", "quit", "exit"}:
+        if not line or line.lower() in ("q", "quit", "exit"):
             break
-        for url in line.split():                      # 一行可粘贴多个网址
+        if line.lower() == "rescan":
+            rescan()
+            continue
+        for url in line.split():
             if not url.startswith(("http://", "https://")):
                 url = "https://" + url
+            existing = find_existing(url)
+            if existing:
+                print("  ! 已剪藏过：%s" % url)
+                for name in existing[:3]:
+                    print("    - %s" % name)
+                if len(existing) > 3:
+                    print("    ...（共 %d 个）" % len(existing))
+                if not confirm("  仍要再次剪藏吗？(新文件会加序号) [y/N] "):
+                    print("  - 已跳过")
+                    continue
             try:
-                result = clip(url)
-                if result is not None:
-                    print("  ✓", result)
-            except Exception as e:
-                print("  ✗", url, "->", e)
+                path = clip(url)
+                print("  ✓ %s" % path)
+                add_index(url, path)
+            except Exception as exc:
+                print("  ✗ %s -> %s" % (url, exc))
 
 
 if __name__ == "__main__":
