@@ -2,12 +2,13 @@
 """网页文章 -> Markdown 剪藏（交互式循环）
 运行: python clip.py ，然后不断粘贴网址回车即可；空行 / q 退出。
 保存目录固定为 ./Clippings/
+已剪藏过的网址（按 frontmatter 的 source 判断）会先询问是否再次剪藏，60 秒无回复则取消。
 依赖: pip install trafilatura requests
 """
-import re, sys, json, datetime
+import re, sys, os, json, time, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, parse_qsl, urlencode
 
 import requests
 import trafilatura
@@ -17,6 +18,7 @@ UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 BOT_UA = "Twitterbot/1.0"  # x.com 对爬虫 UA 才返回带 og 标签的静态页
 X_HOSTS = {"x.com", "twitter.com", "mobile.twitter.com"}
+CONFIRM_TIMEOUT = 60  # 重复剪藏确认的等待秒数，超时视为取消
 
 # Windows 保留设备名（不区分大小写，带扩展名也非法）
 WIN_RESERVED = {"CON", "PRN", "AUX", "NUL",
@@ -236,6 +238,80 @@ def clip_generic(url):
     return write_md(title, fields, body)
 
 
+def url_key(url):
+    """用于判断“是否同一网页”的规范化键：忽略协议/www/片段/末尾斜杠/跟踪参数"""
+    u = urlsplit((url or "").strip())
+    host = u.netloc.lower().removeprefix("www.")
+    if host in X_HOSTS:
+        m = re.search(r"/status(?:es)?/(\d+)", u.path)
+        if m:
+            return "x:" + m.group(1)           # 推文 ID 唯一，x.com/twitter.com 通用
+    q = [(k, v) for k, v in parse_qsl(u.query)
+         if not k.lower().startswith("utm_") and k.lower() not in {"fbclid", "gclid", "spm", "from"}]
+    return host + u.path.rstrip("/") + ("?" + urlencode(sorted(q)) if q else "")
+
+
+def find_existing(url):
+    """在保存目录中按 frontmatter 的 source 查找已剪藏的文件，返回路径列表"""
+    key, found = url_key(url), []
+    if not SAVE_DIR.is_dir():
+        return found
+    for f in SAVE_DIR.glob("*.md"):
+        try:
+            head = f.read_text(encoding="utf-8", errors="ignore")[:2000]
+        except OSError:
+            continue
+        m = re.search(r'^source:\s*"((?:[^"\\]|\\.)*)"', head, re.M)
+        if m and url_key(m.group(1).replace('\\"', '"').replace("\\\\", "\\")) == key:
+            found.append(f)
+    return found
+
+
+def ask_timeout(prompt, timeout=None):
+    """带超时的单行输入；超时返回 None（Linux/macOS/Termux 用 select，Windows 用 msvcrt 轮询）"""
+    timeout = CONFIRM_TIMEOUT if timeout is None else timeout
+    print(prompt, end="", flush=True)
+    try:
+        import select
+        r, _, _ = select.select([sys.stdin], [], [], timeout)
+        if not r:
+            return None
+        return sys.stdin.readline().strip()
+    except (ImportError, OSError, ValueError):
+        pass
+    try:
+        import msvcrt
+        buf, end = "", time.time() + timeout
+        while time.time() < end:
+            if msvcrt.kbhit():
+                ch = msvcrt.getwche()
+                if ch in ("\r", "\n"):
+                    print()
+                    return buf.strip()
+                if ch == "\b":
+                    buf = buf[:-1]
+                else:
+                    buf += ch
+            time.sleep(0.05)
+        return None
+    except ImportError:
+        return input().strip()
+
+
+def confirm_duplicate(url, existing):
+    print("  ⚠ 该网页已剪藏过：")
+    for f in existing:
+        print("    ·", f)
+    ans = ask_timeout(f"  是否再次剪藏？[y/N]（{CONFIRM_TIMEOUT} 秒内未回复则取消）: ")
+    if ans is None:
+        print("\n  ⏱ 超时未回复，已取消保存")
+        return False
+    if ans.lower() in {"y", "yes", "是", "好"}:
+        return True
+    print("  已取消")
+    return False
+
+
 def clip(url):
     host = (urlparse(url).netloc or "").lower().removeprefix("www.")
     return clip_x(url) if host in X_HOSTS else clip_generic(url)
@@ -255,6 +331,9 @@ def main():
             if not url.startswith(("http://", "https://")):
                 url = "https://" + url
             try:
+                existing = find_existing(url)
+                if existing and not confirm_duplicate(url, existing):
+                    continue
                 print("  ✓", clip(url))
             except Exception as e:
                 print("  ✗", url, "->", e)
