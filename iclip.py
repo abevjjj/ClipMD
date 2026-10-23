@@ -363,8 +363,95 @@ def x_api(url):
         raise RuntimeError("fxtwitter 返回的不是有效 JSON")
 
 
+def _media_url(entity):
+    """从 fxtwitter 的 media_entities 条目里取图片/视频地址。"""
+    if not isinstance(entity, dict):
+        return ""
+    info = entity.get("media_info") or {}
+    url = info.get("original_img_url") or info.get("url") or entity.get("url")
+    if url:
+        return url
+    best, rate = "", -1
+    for var in info.get("variants") or []:
+        if not isinstance(var, dict) or not var.get("url"):
+            continue
+        if "mp4" not in str(var.get("content_type", "mp4")):
+            continue
+        bitrate = var.get("bit_rate") or var.get("bitrate") or 0
+        if bitrate > rate:
+            best, rate = var["url"], bitrate
+    return best or info.get("preview_image_url") or ""
+
+
+def _entity_map(content):
+    """把 entityMap（列表或字典两种形态）统一成 {key字符串: entity}。"""
+    raw = content.get("entityMap") or {}
+    result = {}
+    if isinstance(raw, dict):
+        items = list(raw.items())
+    else:
+        items = []
+        for pos, item in enumerate(raw):
+            if isinstance(item, dict) and "key" in item:
+                items.append((item.get("key"), item.get("value")))
+            else:
+                items.append((pos, item))
+    for key, value in items:
+        if isinstance(value, dict) and "value" in value and "type" not in value:
+            value = value["value"]
+        result[str(key)] = value if isinstance(value, dict) else {}
+    return result
+
+
+def _atomic_to_md(block, entities, media_urls, used):
+    """文章里的“原子块”（图片、代码、分割线等）本身没有文字，内容在 entityMap 里。"""
+    out = []
+    for rng in block.get("entityRanges") or []:
+        ent = entities.get(str(rng.get("key")), {})
+        kind = str(ent.get("type", "")).upper()
+        data = ent.get("data") or {}
+        if kind == "MEDIA":
+            caption = (data.get("caption") or "").replace("\n", " ").strip()
+            for item in data.get("mediaItems") or []:
+                url = ""
+                for k in ("mediaId", "media_id", "localMediaId"):
+                    if item.get(k) is not None:
+                        url = media_urls.get(str(item.get(k)), "")
+                        if url:
+                            break
+                if url:
+                    used.add(url)
+                    out.append("![%s](%s)" % (caption, url))
+        elif kind == "MARKDOWN":
+            md = (data.get("markdown") or "").strip()
+            if md:
+                out.append(md)
+        elif kind == "DIVIDER":
+            out.append("---")
+        elif kind == "TWEET":
+            tid = data.get("tweetId") or data.get("id")
+            if tid:
+                out.append("https://x.com/i/status/%s" % tid)
+    return out
+
+
 def article_to_md(article):
-    blocks = ((article.get("content") or {}).get("blocks")) or []
+    content = article.get("content") or {}
+    blocks = content.get("blocks") or []
+    entities = _entity_map(content)
+    media_urls = {}
+    ordered = []
+    for ent in article.get("media_entities") or []:
+        if not isinstance(ent, dict):
+            continue
+        url = _media_url(ent)
+        if not url:
+            continue
+        ordered.append(url)
+        for k in ("media_id", "id", "mediaId"):
+            if ent.get(k) is not None:
+                media_urls[str(ent[k])] = url
+    used = set()
     out = []
     number = 0
     for block in blocks:
@@ -374,6 +461,9 @@ def article_to_md(article):
             number += 1
         else:
             number = 0
+        if kind == "atomic":
+            out.extend(_atomic_to_md(block, entities, media_urls, used))
+            continue
         if not text:
             continue
         if kind == "header-one":
@@ -392,6 +482,12 @@ def article_to_md(article):
             out.append("```\n" + text + "\n```")
         else:
             out.append(text)
+    if not used:
+        # 没能从正文位置匹配到图片时，把文章附带的图片放到末尾，避免丢图。
+        for url in ordered:
+            if url not in used:
+                used.add(url)
+                out.append("![](%s)" % url)
     return "\n\n".join(out)
 
 
@@ -452,14 +548,19 @@ def clip_x(url):
             desc = (article.get("title") or tweet.get("text") or "").strip()
             body = article_to_md(article)
             cover = (((article.get("cover_media") or {}).get("media_info")) or {}).get("original_img_url")
-            if cover:
+            if cover and cover not in body:
                 body = "![](%s)\n\n%s" % (cover, body)
         else:
             desc = (tweet.get("text") or "").strip()
             body = desc
-        extra = media_md(tweet)
-        if extra:
-            body += "\n\n" + extra
+        # 推文自带的媒体：正文里已出现的图片不再重复追加
+        extra_lines = []
+        for ln in media_md(tweet).split("\n\n"):
+            m = re.search(r"\(([^()]+)\)$", ln)
+            if ln and not (m and m.group(1) in body):
+                extra_lines.append(ln)
+        if extra_lines:
+            body += "\n\n" + "\n\n".join(extra_lines)
         quoted = tweet.get("quote")
         if quoted:
             body += "\n\n> 引用 " + (quoted.get("url") or "") + "\n> " + (quoted.get("text") or "").replace("\n", "\n> ")
@@ -514,7 +615,8 @@ def clip_generic(url):
 # 不遍历目录、不扫描所有 md（这类操作在 iSH 上可能闪退）。
 # 旧的剪藏文件可在提示符下输入 rescan 手动导入一次。
 # ---------------------------------------------------------------------------
-INDEX_NAME = ".iclip_index.tsv"
+INDEX_NAME = "_iclip_index.tsv"
+OLD_INDEX_NAME = ".iclip_index.tsv"
 
 TRACK_PARAMS = set(["fbclid", "gclid", "igshid", "spm", "ref", "ref_src",
                     "mc_cid", "mc_eid", "s", "t"])
@@ -551,6 +653,16 @@ def norm_url(url):
 
 def index_path():
     return str(SAVE_DIR / INDEX_NAME)
+
+
+def migrate_index():
+    """旧索引文件改名为新名字（只在新文件不存在时进行）。"""
+    try:
+        old = str(SAVE_DIR / OLD_INDEX_NAME)
+        if os.path.exists(old) and not os.path.exists(index_path()):
+            os.rename(old, index_path())
+    except Exception:
+        pass
 
 
 def load_index():
@@ -669,6 +781,7 @@ def clip(url):
 def main():
     print("网页剪藏（iSH 轻依赖版） -> %s" % SAVE_DIR.resolve())
     print("粘贴网址回车；一行可放多个网址；空行、q 或 Ctrl-D 退出。")
+    migrate_index()
     print("已剪藏过的网址会先询问；输入 rescan 可把旧剪藏导入去重索引。")
     while True:
         try:
